@@ -1,11 +1,6 @@
-# ============================================================
-# ERYX MUSIC
-# Discord.py + Wavelink 3.5.x + Lavalink v4
-# ============================================================
-
 import asyncio
-import time
-from collections import defaultdict, deque
+import os
+from collections import deque
 
 import discord
 from discord import app_commands
@@ -15,21 +10,17 @@ import wavelink
 
 # ============================================================
 # CONFIG
-# EDIT THESE 2 VALUES
 # ============================================================
 
-DISCORD_TOKEN = "PASTE_YOUR_DISCORD_BOT_TOKEN_HERE"
+DISCORD_TOKEN = "YOUR_DISCORD_BOT_TOKEN"
 
 LAVALINK_HOST = "lavalink-2026-production-07a0.up.railway.app"
 LAVALINK_PORT = 443
-LAVALINK_PASSWORD = "PASTE_YOUR_LAVALINK_PASSWORD_HERE"
+LAVALINK_PASSWORD = "YOUR_LAVALINK_PASSWORD"
 LAVALINK_SECURE = True
 
-# Prefix commands:
-# !!play song
-# !!skip
-# !!queue
 PREFIX = "!!"
+MAX_VOLUME = 300
 
 
 # ============================================================
@@ -38,39 +29,13 @@ PREFIX = "!!"
 
 intents = discord.Intents.default()
 intents.guilds = True
-intents.voice_states = True
 intents.members = True
+intents.voice_states = True
 intents.message_content = True
 
 
 # ============================================================
-# DATA
-# ============================================================
-
-guild_settings = defaultdict(
-    lambda: {
-        "volume": 100,
-        "loop": "off",
-        "cleanup": True,
-    }
-)
-
-guild_history = defaultdict(
-    lambda: deque(maxlen=50)
-)
-
-guild_favorites = defaultdict(list)
-guild_likes = defaultdict(set)
-guild_feedback = defaultdict(list)
-
-text_channels = {}
-search_cache = {}
-
-started_at = time.time()
-
-
-# ============================================================
-# BOT
+# MUSIC BOT
 # ============================================================
 
 class ErYxMusic(commands.Bot):
@@ -82,783 +47,513 @@ class ErYxMusic(commands.Bot):
             help_command=None
         )
 
+        self.history = {}
+        self.search_cache = {}
+        self.favorites = {}
+        self.loops = {}
+        self.effects = {}
+        self.start_times = {}
+
     async def setup_hook(self):
 
         print("[ErYx] Connecting to Lavalink...")
 
-        scheme = "https" if LAVALINK_SECURE else "http"
-
-        uri = (
-            f"{scheme}://"
-            f"{LAVALINK_HOST}:"
-            f"{LAVALINK_PORT}"
-        )
-
-        node = wavelink.Node(
-            identifier="ErYx-Lavalink",
-            uri=uri,
-            password=LAVALINK_PASSWORD,
-            retries=None,
-            resume_timeout=60,
-        )
-
-        await wavelink.Pool.connect(
-            nodes=[node],
-            client=self
-        )
-
-        print("[ErYx] Lavalink connection started.")
-
         try:
-            synced = await self.tree.sync()
-            print(
-                f"[ErYx] Synced {len(synced)} slash commands."
+            uri = (
+                f"https://{LAVALINK_HOST}:{LAVALINK_PORT}"
+                if LAVALINK_SECURE
+                else f"http://{LAVALINK_HOST}:{LAVALINK_PORT}"
             )
+
+            node = wavelink.Node(
+                identifier="ErYx-Lavalink",
+                uri=uri,
+                password=LAVALINK_PASSWORD,
+                retries=None,
+                resume_timeout=60,
+            )
+
+            await wavelink.Pool.connect(
+                nodes=[node],
+                client=self
+            )
+
+            print("[ErYx] Lavalink connected.")
+
         except Exception as e:
-            print(
-                f"[ErYx] Slash sync error: {e}"
-            )
+            print(f"[ErYx] Lavalink connection error: {type(e).__name__}: {e}")
+
+        await self.tree.sync()
+        print("[ErYx] Slash commands synced.")
 
     async def on_ready(self):
+        print("================================")
+        print(f"ErYx Music online")
+        print(f"Bot: {self.user}")
+        print(f"Guilds: {len(self.guilds)}")
+        print("================================")
 
-        print()
-        print("======================================")
-        print("          ERYX MUSIC ONLINE")
-        print("======================================")
-        print(f"Bot       : {self.user}")
-        print(f"Guilds    : {len(self.guilds)}")
-        print(f"Prefix    : {PREFIX}")
-        print("Volume    : 0-300%")
-        print("Search    : Top 15")
-        print("Lavalink  : Connected")
-        print("======================================")
-        print()
+        await self.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.listening,
+                name="/play | ErYx Music"
+            )
+        )
 
 
 bot = ErYxMusic()
 
 
 # ============================================================
-# LAVALINK EVENTS
+# HELPERS
 # ============================================================
 
-@bot.listen()
-async def on_wavelink_node_ready(payload):
-
-    print(
-        f"[Lavalink] READY: "
-        f"{payload.node.identifier}"
-    )
+def get_player(guild: discord.Guild):
+    return guild.voice_client
 
 
-@bot.listen()
-async def on_wavelink_node_disconnected(payload):
+async def ensure_voice(interaction: discord.Interaction):
 
-    print(
-        f"[Lavalink] DISCONNECTED: "
-        f"{payload.node.identifier}"
-    )
+    if not interaction.guild:
+        return None
 
+    user_channel = getattr(interaction.user.voice, "channel", None)
+
+    if not user_channel:
+        await interaction.followup.send(
+            "❌ You need to be in a voice channel.",
+            ephemeral=True
+        )
+        return None
+
+    player = interaction.guild.voice_client
+
+    if player:
+        if player.channel != user_channel:
+            try:
+                await player.move_to(user_channel)
+            except Exception:
+                pass
+
+        return player
+
+    try:
+        player = await user_channel.connect(cls=wavelink.Player)
+        return player
+
+    except Exception as e:
+        await interaction.followup.send(
+            f"❌ Couldn't join the voice channel.\n`{type(e).__name__}: {e}`",
+            ephemeral=True
+        )
+        return None
+
+
+async def search_track(query: str):
+
+    try:
+        tracks = await wavelink.Playable.search(
+            query,
+            source=wavelink.TrackSource.YouTubeMusic
+        )
+
+        if tracks:
+            return tracks
+
+    except Exception as e:
+        print(f"[Search] YouTube Music error: {e}")
+
+    try:
+        tracks = await wavelink.Playable.search(query)
+
+        if tracks:
+            return tracks
+
+    except Exception as e:
+        print(f"[Search] fallback error: {e}")
+
+    return []
+
+
+async def play_track(
+    interaction: discord.Interaction,
+    query: str,
+    force: bool = False
+):
+
+    await interaction.response.defer()
+
+    player = await ensure_voice(interaction)
+
+    if not player:
+        return
+
+    tracks = await search_track(query)
+
+    if not tracks:
+        await interaction.followup.send(
+            "❌ No results found."
+        )
+        return
+
+    track = tracks[0]
+
+    if not force and player.playing:
+        player.queue.put(track)
+
+        await interaction.followup.send(
+            f"➕ Added to queue: **{track.title}**"
+        )
+        return
+
+    try:
+        await player.play(track)
+
+        player.queue.mode = wavelink.QueueMode.normal
+
+        await interaction.followup.send(
+            f"▶️ Now playing: **{track.title}**"
+        )
+
+    except Exception as e:
+        print(f"[Play] Error: {type(e).__name__}: {e}")
+
+        await interaction.followup.send(
+            f"❌ Playback error: `{type(e).__name__}: {e}`"
+        )
+
+
+def add_history(guild_id: int, track):
+
+    if guild_id not in bot.history:
+        bot.history[guild_id] = deque(maxlen=50)
+
+    bot.history[guild_id].appendleft(track)
+
+
+# ============================================================
+# WAVELINK EVENTS
+# ============================================================
 
 @bot.listen()
 async def on_wavelink_track_start(payload):
 
     player = payload.player
+    track = payload.track
 
-    if not player or not player.guild:
+    if not player.guild:
         return
 
-    if payload.track:
+    guild_id = player.guild.id
 
-        guild_history[
-            player.guild.id
-        ].appendleft(
-            payload.track
-        )
-
-    channel = text_channels.get(
-        player.guild.id
+    print(
+        f"[Music] {player.guild.name}: "
+        f"Playing {track.title}"
     )
 
-    if not channel:
-        return
+    bot.start_times[guild_id] = asyncio.get_event_loop().time()
 
     try:
-
-        embed = discord.Embed(
-            title="▶ Now Playing",
-            description=(
-                f"**{payload.track.title}**\n"
-                f"`{payload.track.author}`"
-            )
+        await player.guild.change_voice_state(
+            channel=player.channel,
+            self_deaf=True
         )
-
-        if payload.track.artwork:
-            embed.set_thumbnail(
-                url=payload.track.artwork
-            )
-
-        await channel.send(
-            embed=embed
-        )
-
-    except Exception as e:
-
-        print(
-            f"[Track Start] {e}"
-        )
+    except Exception:
+        pass
 
 
 @bot.listen()
 async def on_wavelink_track_end(payload):
 
     player = payload.player
+    track = payload.track
 
-    if not player or not player.guild:
+    if not player.guild:
         return
 
     guild_id = player.guild.id
-    settings = guild_settings[guild_id]
 
-    # Track loop
-    if settings["loop"] == "track":
+    add_history(guild_id, track)
 
-        if payload.track:
+    loop_mode = bot.loops.get(guild_id, "off")
 
-            try:
-                await player.play(
-                    payload.track
-                )
-                return
-            except Exception as e:
-                print(
-                    f"[Loop Error] {e}"
-                )
-
-    # Queue loop
-    elif settings["loop"] == "queue":
-
-        if payload.track:
-
-            try:
-                await player.queue.put_wait(
-                    payload.track
-                )
-            except Exception as e:
-                print(
-                    f"[Queue Loop] {e}"
-                )
-
-    # Auto cleanup
-    if (
-        not player.queue
-        and settings["cleanup"]
-    ):
-
-        await asyncio.sleep(3)
+    if loop_mode == "track":
 
         try:
+            await player.play(track)
+            return
+        except Exception as e:
+            print(f"[Loop] {e}")
 
-            if (
-                player.channel
-                and len(player.channel.members) <= 1
-            ):
-                await player.disconnect()
-
+    if loop_mode == "queue":
+        try:
+            player.queue.put(track)
         except Exception:
             pass
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+@bot.listen()
+async def on_wavelink_track_exception(payload):
 
-def get_player(guild):
-
-    if not guild:
-        return None
-
-    return guild.voice_client
-
-
-def duration(ms):
-
-    seconds = max(
-        0,
-        int(ms / 1000)
-    )
-
-    hours = seconds // 3600
-    minutes = (seconds % 3600) // 60
-    seconds %= 60
-
-    if hours:
-
-        return (
-            f"{hours}:"
-            f"{minutes:02}:"
-            f"{seconds:02}"
-        )
-
-    return (
-        f"{minutes}:"
-        f"{seconds:02}"
+    print(
+        f"[Lavalink] Track exception: "
+        f"{type(payload.exception).__name__}: "
+        f"{payload.exception}"
     )
 
 
-def track_text(track, number=None):
+@bot.listen()
+async def on_wavelink_track_stuck(payload):
 
-    prefix = ""
-
-    if number is not None:
-        prefix = f"**{number}.** "
-
-    return (
-        f"{prefix}{track.title}\n"
-        f"└ `{track.author}` • "
-        f"`{duration(track.length)}`"
+    print(
+        f"[Lavalink] Track stuck: "
+        f"{payload.track.title}"
     )
-
-
-async def connect_player(interaction):
-
-    if not interaction.user.voice:
-
-        await interaction.response.send_message(
-            "Join a voice channel first.",
-            ephemeral=True
-        )
-
-        return None
-
-    channel = interaction.user.voice.channel
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if player:
-
-        try:
-
-            if player.channel != channel:
-                await player.move_to(channel)
-
-        except Exception:
-            pass
-
-        return player
-
-    try:
-
-        player = await channel.connect(
-            cls=wavelink.Player,
-            self_deaf=True
-        )
-
-        return player
-
-    except Exception as e:
-
-        print(
-            f"[VOICE ERROR] "
-            f"{type(e).__name__}: {e}"
-        )
-
-        await interaction.response.send_message(
-            "I couldn't join that voice channel.",
-            ephemeral=True
-        )
-
-        return None
-
-
-async def search_music(query):
-
-    try:
-
-        return await wavelink.Playable.search(
-            query,
-            source=wavelink.TrackSource.YouTubeMusic
-        )
-
-    except Exception:
-
-        return await wavelink.Playable.search(
-            query
-        )
-
-
-async def get_first_track(query):
-
-    result = await search_music(query)
-
-    if not result:
-        return None
-
-    if isinstance(
-        result,
-        wavelink.Playlist
-    ):
-
-        if not result.tracks:
-            return None
-
-        return result.tracks[0]
-
-    return result[0]
-
-
-async def add_track(player, track):
-
-    if player.current:
-
-        await player.queue.put_wait(
-            track
-        )
-
-        return False
-
-    await player.play(
-        track
-    )
-
-    return True
-
-
-async def simple_message(
-    interaction,
-    message
-):
-
-    if interaction.response.is_done():
-
-        await interaction.followup.send(
-            message
-        )
-
-    else:
-
-        await interaction.response.send_message(
-            message
-        )
 
 
 # ============================================================
 # /PLAY
 # ============================================================
 
-@bot.tree.command(
-    name="play",
-    description="Play a song."
-)
-@app_commands.describe(
-    query="Song name or URL"
-)
+@bot.tree.command(name="play", description="Play a song")
+@app_commands.describe(query="Song name or URL")
 async def play(
-    interaction,
+    interaction: discord.Interaction,
     query: str
 ):
-
-    await interaction.response.defer()
-
-    player = await connect_player(
-        interaction
-    )
-
-    if not player:
-        return
-
-    text_channels[
-        interaction.guild.id
-    ] = interaction.channel
-
-    try:
-
-        result = await search_music(
-            query
-        )
-
-        if not result:
-
-            return await interaction.followup.send(
-                "No results found."
-            )
-
-        # Playlist
-        if isinstance(
-            result,
-            wavelink.Playlist
-        ):
-
-            count = 0
-
-            for track in result.tracks:
-
-                await player.queue.put_wait(
-                    track
-                )
-
-                count += 1
-
-            if not player.current and player.queue:
-
-                track = await player.queue.get()
-
-                await player.play(
-                    track
-                )
-
-            return await interaction.followup.send(
-                f"Added **{count} tracks**."
-            )
-
-        track = result[0]
-
-        started = await add_track(
-            player,
-            track
-        )
-
-        if started:
-
-            message = (
-                f"▶ Playing **{track.title}**"
-            )
-
-        else:
-
-            message = (
-                f"Added to queue: "
-                f"**{track.title}**"
-            )
-
-        await interaction.followup.send(
-            message
-        )
-
-    except Exception as e:
-
-        print(
-            f"[PLAY ERROR] "
-            f"{type(e).__name__}: {e}"
-        )
-
-        await interaction.followup.send(
-            f"Playback error: "
-            f"`{type(e).__name__}`"
-        )
+    await play_track(interaction, query)
 
 
 # ============================================================
-# /SEARCH — TOP 15
+# /P
 # ============================================================
 
-@bot.tree.command(
-    name="search",
-    description="Search music and show the top 15 results."
-)
-@app_commands.describe(
-    query="What do you want to search for?"
-)
-async def search(
-    interaction,
+@bot.tree.command(name="p", description="Play a song")
+@app_commands.describe(query="Song name or URL")
+async def p(
+    interaction: discord.Interaction,
     query: str
 ):
-
-    await interaction.response.defer()
-
-    try:
-
-        result = await search_music(
-            query
-        )
-
-        if not result:
-
-            return await interaction.followup.send(
-                "No results found."
-            )
-
-        if isinstance(
-            result,
-            wavelink.Playlist
-        ):
-
-            tracks = list(
-                result.tracks
-            )
-
-        else:
-
-            tracks = list(result)
-
-        # HARD TOP 15
-        tracks = tracks[:15]
-
-        search_cache[
-            interaction.user.id
-        ] = tracks
-
-        lines = []
-
-        for number, track in enumerate(
-            tracks,
-            1
-        ):
-
-            lines.append(
-                track_text(
-                    track,
-                    number
-                )
-            )
-
-        embed = discord.Embed(
-            title="🔎 ErYx Music — Search Suggestions",
-            description="\n\n".join(lines)
-        )
-
-        embed.set_footer(
-            text="Top 15 results • Use /play <song> to play"
-        )
-
-        await interaction.followup.send(
-            embed=embed
-        )
-
-    except Exception as e:
-
-        print(
-            f"[SEARCH ERROR] "
-            f"{type(e).__name__}: {e}"
-        )
-
-        await interaction.followup.send(
-            f"Search failed: "
-            f"`{type(e).__name__}`"
-        )
-
-
-# ============================================================
-# /SKIP
-# ============================================================
-
-@bot.tree.command(
-    name="skip",
-    description="Skip the current song."
-)
-async def skip(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
-        )
-
-    await player.skip()
-
-    await interaction.response.send_message(
-        "⏭ Skipped."
-    )
-
-
-# ============================================================
-# /STOP
-# ============================================================
-
-@bot.tree.command(
-    name="stop",
-    description="Stop music and clear the queue."
-)
-async def stop(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player:
-
-        return await interaction.response.send_message(
-            "I'm not connected.",
-            ephemeral=True
-        )
-
-    player.queue.clear()
-
-    await player.stop()
-
-    await interaction.response.send_message(
-        "⏹ Playback stopped."
-    )
+    await play_track(interaction, query)
 
 
 # ============================================================
 # /PLAYNOW
 # ============================================================
 
-@bot.tree.command(
-    name="playnow",
-    description="Immediately play a song."
-)
-@app_commands.describe(
-    query="Song"
-)
+@bot.tree.command(name="playnow", description="Immediately play a song")
+@app_commands.describe(query="Song name or URL")
 async def playnow(
-    interaction,
+    interaction: discord.Interaction,
+    query: str
+):
+    await play_track(interaction, query, True)
+
+
+# ============================================================
+# /PLAYSКIP
+# ============================================================
+
+@bot.tree.command(name="playskip", description="Play a song immediately")
+@app_commands.describe(query="Song name or URL")
+async def playskip(
+    interaction: discord.Interaction,
+    query: str
+):
+    await play_track(interaction, query, True)
+
+
+# ============================================================
+# /PLAYTOP
+# ============================================================
+
+@bot.tree.command(name="playtop", description="Add a song to the front")
+@app_commands.describe(query="Song name or URL")
+async def playtop(
+    interaction: discord.Interaction,
     query: str
 ):
 
     await interaction.response.defer()
 
-    player = await connect_player(
-        interaction
-    )
+    player = await ensure_voice(interaction)
 
     if not player:
         return
 
+    tracks = await search_track(query)
+
+    if not tracks:
+        await interaction.followup.send("❌ No results found.")
+        return
+
+    track = tracks[0]
+
     try:
-
-        track = await get_first_track(
-            query
-        )
-
-        if not track:
-
-            return await interaction.followup.send(
-                "No results found."
-            )
-
-        await player.play(
-            track
-        )
+        player.queue.put_at(0, track)
 
         await interaction.followup.send(
-            f"▶ Now playing **{track.title}**"
+            f"⬆️ Added to top: **{track.title}**"
         )
 
     except Exception as e:
-
         await interaction.followup.send(
-            f"Playback error: "
-            f"`{type(e).__name__}`"
+            f"❌ Could not add track: `{e}`"
         )
 
 
 # ============================================================
-# /P — PLAY ALIAS
+# /SEARCH
 # ============================================================
 
-@bot.tree.command(
-    name="p",
-    description="Quick play a song."
-)
-@app_commands.describe(
-    query="Song"
-)
-async def slash_p(
-    interaction,
+@bot.tree.command(name="search", description="Search for music")
+@app_commands.describe(query="What do you want to search?")
+async def search(
+    interaction: discord.Interaction,
     query: str
 ):
 
-    await play.callback(
-        interaction,
-        query
+    await interaction.response.defer()
+
+    tracks = await search_track(query)
+
+    if not tracks:
+        await interaction.followup.send(
+            "❌ Nothing found."
+        )
+        return
+
+    tracks = tracks[:15]
+
+    bot.search_cache[interaction.user.id] = tracks
+
+    embed = discord.Embed(
+        title="🔎 ErYx Music Search",
+        description=f"Results for **{query}**",
+        color=discord.Color.blurple()
     )
 
+    for i, track in enumerate(tracks, 1):
 
-# ============================================================
-# /PLAYS KIP
-# ============================================================
+        duration = getattr(track, "length", 0)
 
-@bot.tree.command(
-    name="playskip",
-    description="Play a song immediately."
-)
-@app_commands.describe(
-    query="Song"
-)
-async def playskip(
-    interaction,
-    query: str
-):
+        if duration:
+            seconds = duration // 1000
+            minutes = seconds // 60
+            seconds %= 60
+            time = f"{minutes}:{seconds:02d}"
+        else:
+            time = "LIVE"
 
-    await playnow.callback(
-        interaction,
-        query
-    )
-
-
-# ============================================================
-# /JOIN
-# ============================================================
-
-@bot.tree.command(
-    name="join",
-    description="Join your voice channel."
-)
-async def join(interaction):
-
-    player = await connect_player(
-        interaction
-    )
-
-    if player:
-
-        await simple_message(
-            interaction,
-            f"Connected to **{player.channel.name}**."
+        embed.add_field(
+            name=f"{i}. {track.title[:80]}",
+            value=f"`{time}`",
+            inline=False
         )
 
+    await interaction.followup.send(embed=embed)
+
 
 # ============================================================
-# /SUMMON
+# /SKIP
 # ============================================================
 
-@bot.tree.command(
-    name="summon",
-    description="Summon ErYx Music."
-)
-async def summon(interaction):
+@bot.tree.command(name="skip", description="Skip current song")
+async def skip(interaction: discord.Interaction):
 
-    await join.callback(
-        interaction
-    )
+    await interaction.response.defer()
+
+    player = get_player(interaction.guild)
+
+    if not player:
+        await interaction.followup.send("❌ I'm not in a voice channel.")
+        return
+
+    if not player.playing:
+        await interaction.followup.send("❌ Nothing is playing.")
+        return
+
+    await player.skip()
+
+    await interaction.followup.send("⏭️ Skipped.")
+
+
+# ============================================================
+# SKIP ALIASES
+# ============================================================
+
+@bot.tree.command(name="fskip", description="Force skip")
+async def fskip(interaction: discord.Interaction):
+    await skip(interaction)
+
+
+@bot.tree.command(name="forceskip", description="Force skip")
+async def forceskip(interaction: discord.Interaction):
+    await skip(interaction)
+
+
+@bot.tree.command(name="fs", description="Force skip")
+async def fs(interaction: discord.Interaction):
+    await skip(interaction)
+
+
+@bot.tree.command(name="pskip", description="Skip current song")
+async def pskip(interaction: discord.Interaction):
+    await skip(interaction)
+
+
+@bot.tree.command(name="vs", description="Skip current song")
+async def vs(interaction: discord.Interaction):
+    await skip(interaction)
+
+
+# ============================================================
+# /STOP
+# ============================================================
+
+@bot.tree.command(name="stop", description="Stop music and clear queue")
+async def stop(interaction: discord.Interaction):
+
+    await interaction.response.defer()
+
+    player = get_player(interaction.guild)
+
+    if not player:
+        await interaction.followup.send("❌ Not connected.")
+        return
+
+    try:
+        player.queue.clear()
+    except Exception:
+        pass
+
+    try:
+        await player.stop()
+    except Exception:
+        pass
+
+    await interaction.followup.send("⏹️ Stopped.")
 
 
 # ============================================================
 # /PAUSE
 # ============================================================
 
-@bot.tree.command(
-    name="pause",
-    description="Pause playback."
-)
-async def pause(interaction):
+@bot.tree.command(name="pause", description="Pause music")
+async def pause(interaction: discord.Interaction):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
-    if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
+    if not player:
+        await interaction.response.send_message(
+            "❌ Not connected."
         )
+        return
 
-    await player.pause(
-        True
-    )
+    await player.pause(True)
 
     await interaction.response.send_message(
-        "⏸ Paused."
+        "⏸️ Paused."
     )
 
 
@@ -866,218 +561,79 @@ async def pause(interaction):
 # /RESUME
 # ============================================================
 
-@bot.tree.command(
-    name="resume",
-    description="Resume playback."
-)
-async def resume(interaction):
+@bot.tree.command(name="resume", description="Resume music")
+async def resume(interaction: discord.Interaction):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
     if not player:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
+        await interaction.response.send_message(
+            "❌ Not connected."
         )
+        return
 
-    await player.pause(
-        False
-    )
+    await player.pause(False)
 
     await interaction.response.send_message(
-        "▶ Resumed."
+        "▶️ Resumed."
     )
 
 
 # ============================================================
-# /VOLUME — MAX 300
+# /VOLUME
 # ============================================================
 
-@bot.tree.command(
-    name="volume",
-    description="Set volume. Maximum 300%."
-)
-@app_commands.describe(
-    amount="Volume from 0 to 300"
-)
+@bot.tree.command(name="volume", description="Set volume")
+@app_commands.describe(volume="0-300")
+@app_commands.Range[int, 0, 300]
 async def volume(
-    interaction,
-    amount: app_commands.Range[int, 0, 300]
+    interaction: discord.Interaction,
+    volume: int
 ):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
     if not player:
-
-        return await interaction.response.send_message(
-            "I'm not connected.",
-            ephemeral=True
+        await interaction.response.send_message(
+            "❌ Not connected."
         )
+        return
 
-    # Extra hard safety check
-    amount = max(
-        0,
-        min(
-            int(amount),
-            300
-        )
-    )
+    volume = max(0, min(volume, MAX_VOLUME))
 
-    await player.set_volume(
-        amount
-    )
-
-    guild_settings[
-        interaction.guild.id
-    ]["volume"] = amount
+    await player.set_volume(volume)
 
     await interaction.response.send_message(
-        f"🔊 Volume set to **{amount}%**."
+        f"🔊 Volume set to **{volume}%**."
     )
 
 
-# ============================================================
-# /VOL
-# ============================================================
-
-@bot.tree.command(
-    name="vol",
-    description="Set volume. Maximum 300%."
-)
-@app_commands.describe(
-    amount="Volume from 0 to 300"
-)
+@bot.tree.command(name="vol", description="Set volume")
+@app_commands.describe(volume="0-300")
+@app_commands.Range[int, 0, 300]
 async def vol(
-    interaction,
-    amount: app_commands.Range[int, 0, 300]
+    interaction: discord.Interaction,
+    volume: int
 ):
-
-    await volume.callback(
-        interaction,
-        amount
-    )
+    await volume_command(interaction, volume)
 
 
-# ============================================================
-# /LEAVE
-# ============================================================
+async def volume_command(interaction, volume):
 
-@bot.tree.command(
-    name="leave",
-    description="Leave the voice channel."
-)
-async def leave(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
     if not player:
-
-        return await interaction.response.send_message(
-            "I'm not in a voice channel.",
-            ephemeral=True
+        await interaction.response.send_message(
+            "❌ Not connected."
         )
+        return
 
-    await player.disconnect()
+    volume = max(0, min(volume, MAX_VOLUME))
+
+    await player.set_volume(volume)
 
     await interaction.response.send_message(
-        "Disconnected."
-    )
-
-
-# ============================================================
-# /DISCONNECT
-# ============================================================
-
-@bot.tree.command(
-    name="disconnect",
-    description="Disconnect from voice."
-)
-async def disconnect(interaction):
-
-    await leave.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /DC
-# ============================================================
-
-@bot.tree.command(
-    name="dc",
-    description="Disconnect."
-)
-async def dc(interaction):
-
-    await leave.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /FUCKOFF
-# ============================================================
-
-@bot.tree.command(
-    name="fuckoff",
-    description="Disconnect ErYx Music."
-)
-async def fuckoff(interaction):
-
-    await leave.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /FORCESKIP
-# ============================================================
-
-@bot.tree.command(
-    name="forceskip",
-    description="Force skip."
-)
-async def forceskip(interaction):
-
-    await skip.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /FSKIP
-# ============================================================
-
-@bot.tree.command(
-    name="fskip",
-    description="Force skip."
-)
-async def fskip(interaction):
-
-    await skip.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /FS
-# ============================================================
-
-@bot.tree.command(
-    name="fs",
-    description="Force skip."
-)
-async def fs(interaction):
-
-    await skip.callback(
-        interaction
+        f"🔊 Volume: **{volume}%**"
     )
 
 
@@ -1085,67 +641,50 @@ async def fs(interaction):
 # /QUEUE
 # ============================================================
 
-@bot.tree.command(
-    name="queue",
-    description="Show the current queue."
-)
-async def queue(interaction):
+@bot.tree.command(name="queue", description="Show queue")
+async def queue(interaction: discord.Interaction):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
     if not player:
-
-        return await interaction.response.send_message(
-            "Queue is empty."
+        await interaction.response.send_message(
+            "❌ Not connected."
         )
+        return
 
     embed = discord.Embed(
-        title="🎵 ErYx Music Queue"
+        title="🎵 ErYx Queue",
+        color=discord.Color.blurple()
     )
 
-    if player.current:
+    current = player.current
 
+    if current:
         embed.add_field(
             name="Now Playing",
-            value=track_text(
-                player.current
-            ),
+            value=f"▶️ **{current.title}**",
             inline=False
         )
 
-    tracks = list(
-        player.queue
-    )
-
-    if not tracks:
-
+    if not player.queue:
         embed.add_field(
-            name="Up Next",
-            value="Nothing queued.",
+            name="Queue",
+            value="Queue is empty.",
             inline=False
         )
 
     else:
 
-        lines = []
+        items = list(player.queue)[:20]
 
-        for number, track in enumerate(
-            tracks[:25],
-            1
-        ):
+        text = ""
 
-            lines.append(
-                track_text(
-                    track,
-                    number
-                )
-            )
+        for i, track in enumerate(items, 1):
+            text += f"`{i}.` {track.title[:70]}\n"
 
         embed.add_field(
-            name=f"Up Next • {len(tracks)}",
-            value="\n\n".join(lines),
+            name=f"Up Next ({len(player.queue)})",
+            value=text,
             inline=False
         )
 
@@ -1154,471 +693,9 @@ async def queue(interaction):
     )
 
 
-# ============================================================
-# /Q
-# ============================================================
-
-@bot.tree.command(
-    name="q",
-    description="Show queue."
-)
-async def q(interaction):
-
-    await queue.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /CLEAR
-# ============================================================
-
-@bot.tree.command(
-    name="clear",
-    description="Clear the queue."
-)
-async def clear(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player:
-
-        return await interaction.response.send_message(
-            "Queue is empty.",
-            ephemeral=True
-        )
-
-    player.queue.clear()
-
-    await interaction.response.send_message(
-        "Queue cleared."
-    )
-
-
-# ============================================================
-# /C
-# ============================================================
-
-@bot.tree.command(
-    name="c",
-    description="Clear queue."
-)
-async def c(interaction):
-
-    await clear.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /SHUFFLE
-# ============================================================
-
-@bot.tree.command(
-    name="shuffle",
-    description="Shuffle the queue."
-)
-async def shuffle(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player or len(player.queue) < 2:
-
-        return await interaction.response.send_message(
-            "You need at least 2 queued songs.",
-            ephemeral=True
-        )
-
-    player.queue.shuffle()
-
-    await interaction.response.send_message(
-        "🔀 Queue shuffled."
-    )
-
-
-# ============================================================
-# /REMOVE
-# ============================================================
-
-@bot.tree.command(
-    name="remove",
-    description="Remove a song from the queue."
-)
-@app_commands.describe(
-    position="Queue position"
-)
-async def remove(
-    interaction,
-    position: int
-):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player:
-
-        return await interaction.response.send_message(
-            "Queue is empty.",
-            ephemeral=True
-        )
-
-    tracks = list(
-        player.queue
-    )
-
-    if position < 1 or position > len(tracks):
-
-        return await interaction.response.send_message(
-            "Invalid queue position.",
-            ephemeral=True
-        )
-
-    removed = tracks.pop(
-        position - 1
-    )
-
-    player.queue.clear()
-
-    for track in tracks:
-
-        await player.queue.put_wait(
-            track
-        )
-
-    await interaction.response.send_message(
-        f"Removed **{removed.title}**."
-    )
-
-
-# ============================================================
-# /RM
-# ============================================================
-
-@bot.tree.command(
-    name="rm",
-    description="Remove a queue song."
-)
-@app_commands.describe(
-    position="Queue position"
-)
-async def rm(
-    interaction,
-    position: int
-):
-
-    await remove.callback(
-        interaction,
-        position
-    )
-
-
-# ============================================================
-# /PLAYTOP
-# ============================================================
-
-@bot.tree.command(
-    name="playtop",
-    description="Put a song at the top of the queue."
-)
-@app_commands.describe(
-    query="Song"
-)
-async def playtop(
-    interaction,
-    query: str
-):
-
-    await interaction.response.defer()
-
-    player = await connect_player(
-        interaction
-    )
-
-    if not player:
-        return
-
-    track = await get_first_track(
-        query
-    )
-
-    if not track:
-
-        return await interaction.followup.send(
-            "No results found."
-        )
-
-    old_queue = list(
-        player.queue
-    )
-
-    player.queue.clear()
-
-    await player.queue.put_wait(
-        track
-    )
-
-    for old in old_queue:
-
-        await player.queue.put_wait(
-            old
-        )
-
-    await interaction.followup.send(
-        f"Added **{track.title}** to the top."
-    )
-
-
-# ============================================================
-# /PT
-# ============================================================
-
-@bot.tree.command(
-    name="pt",
-    description="Play top."
-)
-@app_commands.describe(
-    query="Song"
-)
-async def pt(
-    interaction,
-    query: str
-):
-
-    await playtop.callback(
-        interaction,
-        query
-    )
-
-
-# ============================================================
-# /PTOP
-# ============================================================
-
-@bot.tree.command(
-    name="ptop",
-    description="Play top."
-)
-@app_commands.describe(
-    query="Song"
-)
-async def ptop(
-    interaction,
-    query: str
-):
-
-    await playtop.callback(
-        interaction,
-        query
-    )
-
-
-# ============================================================
-# /SKIPTO
-# ============================================================
-
-@bot.tree.command(
-    name="skipto",
-    description="Skip to a queue position."
-)
-@app_commands.describe(
-    position="Queue position"
-)
-async def skipto(
-    interaction,
-    position: int
-):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
-        )
-
-    tracks = list(
-        player.queue
-    )
-
-    if position < 1 or position > len(tracks):
-
-        return await interaction.response.send_message(
-            "Invalid queue position.",
-            ephemeral=True
-        )
-
-    target = tracks[
-        position - 1
-    ]
-
-    remaining = tracks[
-        position:
-    ]
-
-    player.queue.clear()
-
-    for track in remaining:
-
-        await player.queue.put_wait(
-            track
-        )
-
-    await player.play(
-        target
-    )
-
-    await interaction.response.send_message(
-        f"▶ Skipped to **{target.title}**."
-    )
-
-
-# ============================================================
-# /LOOP
-# ============================================================
-
-@bot.tree.command(
-    name="loop",
-    description="Set loop mode."
-)
-@app_commands.describe(
-    mode="off, track, or queue"
-)
-async def loop(
-    interaction,
-    mode: str = "track"
-):
-
-    mode = mode.lower()
-
-    if mode not in (
-        "off",
-        "track",
-        "queue"
-    ):
-
-        return await interaction.response.send_message(
-            "Use: `off`, `track`, or `queue`.",
-            ephemeral=True
-        )
-
-    guild_settings[
-        interaction.guild.id
-    ]["loop"] = mode
-
-    await interaction.response.send_message(
-        f"🔁 Loop mode: **{mode}**"
-    )
-
-
-# ============================================================
-# /REPEAT
-# ============================================================
-
-@bot.tree.command(
-    name="repeat",
-    description="Repeat current song."
-)
-async def repeat(interaction):
-
-    guild_settings[
-        interaction.guild.id
-    ]["loop"] = "track"
-
-    await interaction.response.send_message(
-        "🔁 Track repeat enabled."
-    )
-
-
-# ============================================================
-# /LOOPQUEUE
-# ============================================================
-
-@bot.tree.command(
-    name="loopqueue",
-    description="Loop the queue."
-)
-async def loopqueue(interaction):
-
-    guild_settings[
-        interaction.guild.id
-    ]["loop"] = "queue"
-
-    await interaction.response.send_message(
-        "🔁 Queue loop enabled."
-    )
-
-
-# ============================================================
-# LOOP ALIASES
-# ============================================================
-
-@bot.tree.command(
-    name="loopq",
-    description="Loop the queue."
-)
-async def loopq(interaction):
-
-    await loopqueue.callback(
-        interaction
-    )
-
-
-@bot.tree.command(
-    name="qloop",
-    description="Loop the queue."
-)
-async def qloop(interaction):
-
-    await loopqueue.callback(
-        interaction
-    )
-
-
-@bot.tree.command(
-    name="queueloop",
-    description="Loop the queue."
-)
-async def queueloop(interaction):
-
-    await loopqueue.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /REPLAY
-# ============================================================
-
-@bot.tree.command(
-    name="replay",
-    description="Replay the current song."
-)
-async def replay(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
-        )
-
-    await player.seek(0)
-
-    await interaction.response.send_message(
-        "↩ Replaying."
-    )
+@bot.tree.command(name="q", description="Show queue")
+async def q(interaction: discord.Interaction):
+    await queue(interaction)
 
 
 # ============================================================
@@ -1627,98 +704,329 @@ async def replay(interaction):
 
 @bot.tree.command(
     name="nowplaying",
-    description="Show the current song."
+    description="Show current song"
 )
-async def nowplaying(interaction):
+async def nowplaying(interaction: discord.Interaction):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
     if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
+        await interaction.response.send_message(
+            "❌ Nothing is playing."
         )
+        return
 
     track = player.current
 
     embed = discord.Embed(
         title="🎵 Now Playing",
-        description=(
-            f"**{track.title}**\n"
-            f"`{track.author}`"
-        )
+        description=f"**{track.title}**",
+        color=discord.Color.blurple()
     )
 
-    if track.artwork:
-
-        embed.set_thumbnail(
-            url=track.artwork
+    if getattr(track, "author", None):
+        embed.add_field(
+            name="Artist",
+            value=track.author,
+            inline=True
         )
 
-    embed.add_field(
-        name="Progress",
-        value=(
-            f"`{duration(player.position)}` / "
-            f"`{duration(track.length)}`"
-        )
-    )
+    if getattr(track, "length", None):
+        seconds = track.length // 1000
+        mins = seconds // 60
+        secs = seconds % 60
 
-    embed.add_field(
-        name="Volume",
-        value=(
-            f"{player.volume}%"
+        embed.add_field(
+            name="Duration",
+            value=f"{mins}:{secs:02d}",
+            inline=True
         )
-    )
-
-    embed.add_field(
-        name="Loop",
-        value=guild_settings[
-            interaction.guild.id
-        ]["loop"]
-    )
 
     await interaction.response.send_message(
         embed=embed
     )
 
 
+@bot.tree.command(name="np", description="Now playing")
+async def np(interaction: discord.Interaction):
+    await nowplaying(interaction)
+
+
+@bot.tree.command(name="pn", description="Now playing")
+async def pn(interaction: discord.Interaction):
+    await nowplaying(interaction)
+
+
 # ============================================================
-# NOW PLAYING ALIASES
+# /LOOP
 # ============================================================
 
-@bot.tree.command(
-    name="np",
-    description="Now playing."
+@bot.tree.command(name="loop", description="Set loop mode")
+@app_commands.describe(mode="off, track or queue")
+@app_commands.choices(
+    mode=[
+        app_commands.Choice(name="Off", value="off"),
+        app_commands.Choice(name="Track", value="track"),
+        app_commands.Choice(name="Queue", value="queue"),
+    ]
 )
-async def np(interaction):
+async def loop(
+    interaction: discord.Interaction,
+    mode: app_commands.Choice[str]
+):
 
-    await nowplaying.callback(
-        interaction
+    bot.loops[interaction.guild.id] = mode.value
+
+    await interaction.response.send_message(
+        f"🔁 Loop mode: **{mode.value}**"
     )
 
 
-@bot.tree.command(
-    name="pn",
-    description="Now playing."
-)
-async def pn(interaction):
+@bot.tree.command(name="repeat", description="Set repeat mode")
+@app_commands.describe(mode="off, track or queue")
+async def repeat(
+    interaction: discord.Interaction,
+    mode: str
+):
 
-    await nowplaying.callback(
-        interaction
+    mode = mode.lower()
+
+    if mode not in ("off", "track", "queue"):
+        await interaction.response.send_message(
+            "❌ Use `off`, `track`, or `queue`."
+        )
+        return
+
+    bot.loops[interaction.guild.id] = mode
+
+    await interaction.response.send_message(
+        f"🔁 Repeat: **{mode}**"
     )
 
 
-@bot.tree.command(
-    name="m",
-    description="Now playing."
-)
-async def m(interaction):
+@bot.tree.command(name="loopq", description="Toggle queue loop")
+async def loopq(interaction: discord.Interaction):
 
-    await nowplaying.callback(
-        interaction
+    guild_id = interaction.guild.id
+
+    current = bot.loops.get(guild_id, "off")
+
+    new = "off" if current == "queue" else "queue"
+
+    bot.loops[guild_id] = new
+
+    await interaction.response.send_message(
+        f"🔁 Queue loop: **{new}**"
+    )
+
+
+@bot.tree.command(name="loopqueue", description="Toggle queue loop")
+async def loopqueue(interaction: discord.Interaction):
+    await loopq(interaction)
+
+
+@bot.tree.command(name="queueloop", description="Toggle queue loop")
+async def queueloop(interaction: discord.Interaction):
+    await loopq(interaction)
+
+
+@bot.tree.command(name="qloop", description="Toggle queue loop")
+async def qloop(interaction: discord.Interaction):
+    await loopq(interaction)
+
+
+# ============================================================
+# /SHUFFLE
+# ============================================================
+
+@bot.tree.command(name="shuffle", description="Shuffle queue")
+async def shuffle(interaction: discord.Interaction):
+
+    player = get_player(interaction.guild)
+
+    if not player:
+        await interaction.response.send_message(
+            "❌ Not connected."
+        )
+        return
+
+    try:
+        player.queue.shuffle()
+        await interaction.response.send_message(
+            "🔀 Queue shuffled."
+        )
+
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Shuffle failed: `{e}`"
+        )
+
+
+# ============================================================
+# /CLEAR
+# ============================================================
+
+@bot.tree.command(name="clear", description="Clear queue")
+async def clear(interaction: discord.Interaction):
+
+    player = get_player(interaction.guild)
+
+    if not player:
+        await interaction.response.send_message(
+            "❌ Not connected."
+        )
+        return
+
+    player.queue.clear()
+
+    await interaction.response.send_message(
+        "🗑️ Queue cleared."
+    )
+
+
+@bot.tree.command(name="c", description="Clear queue")
+async def c(interaction: discord.Interaction):
+    await clear(interaction)
+
+
+# ============================================================
+# /REMOVE
+# ============================================================
+
+@bot.tree.command(name="remove", description="Remove a queue item")
+@app_commands.describe(position="Queue position")
+async def remove(
+    interaction: discord.Interaction,
+    position: int
+):
+
+    player = get_player(interaction.guild)
+
+    if not player:
+        await interaction.response.send_message(
+            "❌ Not connected."
+        )
+        return
+
+    items = list(player.queue)
+
+    if position < 1 or position > len(items):
+        await interaction.response.send_message(
+            "❌ Invalid queue position."
+        )
+        return
+
+    track = items[position - 1]
+
+    try:
+        player.queue.remove(track)
+    except Exception:
+        await interaction.response.send_message(
+            "❌ Could not remove track."
+        )
+        return
+
+    await interaction.response.send_message(
+        f"🗑️ Removed **{track.title}**"
+    )
+
+
+@bot.tree.command(name="rm", description="Remove queue item")
+@app_commands.describe(position="Queue position")
+async def rm(
+    interaction: discord.Interaction,
+    position: int
+):
+    await remove(interaction, position)
+
+
+# ============================================================
+# /MOVE
+# ============================================================
+
+@bot.tree.command(name="move", description="Move a queue item")
+@app_commands.describe(
+    from_position="Current position",
+    to_position="New position"
+)
+async def move(
+    interaction: discord.Interaction,
+    from_position: int,
+    to_position: int
+):
+
+    player = get_player(interaction.guild)
+
+    if not player:
+        await interaction.response.send_message(
+            "❌ Not connected."
+        )
+        return
+
+    items = list(player.queue)
+
+    if (
+        from_position < 1
+        or from_position > len(items)
+        or to_position < 1
+        or to_position > len(items)
+    ):
+        await interaction.response.send_message(
+            "❌ Invalid position."
+        )
+        return
+
+    track = items.pop(from_position - 1)
+    items.insert(to_position - 1, track)
+
+    player.queue.clear()
+
+    for item in items:
+        player.queue.put(item)
+
+    await interaction.response.send_message(
+        f"↔️ Moved **{track.title}**."
+    )
+
+
+# ============================================================
+# /SKIPTO
+# ============================================================
+
+@bot.tree.command(name="skipto", description="Skip to queue position")
+@app_commands.describe(position="Queue position")
+async def skipto(
+    interaction: discord.Interaction,
+    position: int
+):
+
+    player = get_player(interaction.guild)
+
+    if not player:
+        await interaction.response.send_message(
+            "❌ Not connected."
+        )
+        return
+
+    items = list(player.queue)
+
+    if position < 1 or position > len(items):
+        await interaction.response.send_message(
+            "❌ Invalid position."
+        )
+        return
+
+    target = items[position - 1]
+
+    player.queue.clear()
+
+    for item in items[position:]:
+        player.queue.put(item)
+
+    await player.play(target)
+
+    await interaction.response.send_message(
+        f"⏭️ Skipped to **{target.title}**"
     )
 
 
@@ -1726,211 +1034,205 @@ async def m(interaction):
 # /SEEK
 # ============================================================
 
-@bot.tree.command(
-    name="seek",
-    description="Seek to a position in seconds."
-)
-@app_commands.describe(
-    seconds="Position in seconds"
-)
+@bot.tree.command(name="seek", description="Seek in the current song")
+@app_commands.describe(seconds="Position in seconds")
 async def seek(
-    interaction,
+    interaction: discord.Interaction,
     seconds: int
 ):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
     if not player or not player.current:
+        await interaction.response.send_message(
+            "❌ Nothing is playing."
+        )
+        return
 
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
+    if seconds < 0:
+        await interaction.response.send_message(
+            "❌ Seconds cannot be negative."
+        )
+        return
+
+    try:
+        await player.seek(seconds * 1000)
+
+        await interaction.response.send_message(
+            f"⏩ Seeked to **{seconds}s**."
         )
 
-    seconds = max(
-        0,
-        min(
-            seconds,
-            player.current.length // 1000
+    except Exception as e:
+        await interaction.response.send_message(
+            f"❌ Seek failed: `{e}`"
         )
-    )
-
-    await player.seek(
-        seconds * 1000
-    )
-
-    await interaction.response.send_message(
-        f"Seeked to `{duration(seconds * 1000)}`."
-    )
 
 
 # ============================================================
 # /FORWARD
 # ============================================================
 
-@bot.tree.command(
-    name="forward",
-    description="Forward the song."
-)
-@app_commands.describe(
-    seconds="Seconds"
-)
-async def forward(
-    interaction,
-    seconds: int = 10
-):
+@bot.tree.command(name="forward", description="Forward 10 seconds")
+async def forward(interaction: discord.Interaction):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
-    if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
+    if not player:
+        await interaction.response.send_message(
+            "❌ Nothing is playing."
         )
+        return
 
-    target = min(
-        player.current.length,
-        player.position + (
-            abs(seconds) * 1000
-        )
-    )
+    position = getattr(player, "position", 0)
 
-    await player.seek(
-        target
-    )
+    await player.seek(position + 10000)
 
     await interaction.response.send_message(
-        f"Forwarded to `{duration(target)}`."
+        "⏩ Forwarded 10 seconds."
     )
+
+
+@bot.tree.command(name="fwd", description="Forward 10 seconds")
+async def fwd(interaction: discord.Interaction):
+    await forward(interaction)
 
 
 # ============================================================
 # /REWIND
 # ============================================================
 
-@bot.tree.command(
-    name="rewind",
-    description="Rewind the song."
-)
-@app_commands.describe(
-    seconds="Seconds"
-)
-async def rewind(
-    interaction,
-    seconds: int = 10
-):
+@bot.tree.command(name="rewind", description="Rewind 10 seconds")
+async def rewind(interaction: discord.Interaction):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
-    if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
+    if not player:
+        await interaction.response.send_message(
+            "❌ Nothing is playing."
         )
+        return
 
-    target = max(
-        0,
-        player.position - (
-            abs(seconds) * 1000
-        )
-    )
+    position = getattr(player, "position", 0)
 
-    await player.seek(
-        target
-    )
+    await player.seek(max(0, position - 10000))
 
     await interaction.response.send_message(
-        f"Rewound to `{duration(target)}`."
+        "⏪ Rewound 10 seconds."
+    )
+
+
+@bot.tree.command(name="rwd", description="Rewind 10 seconds")
+async def rwd(interaction: discord.Interaction):
+    await rewind(interaction)
+
+
+# ============================================================
+# /REPLAY
+# ============================================================
+
+@bot.tree.command(name="replay", description="Replay current song")
+async def replay(interaction: discord.Interaction):
+
+    player = get_player(interaction.guild)
+
+    if not player or not player.current:
+        await interaction.response.send_message(
+            "❌ Nothing is playing."
+        )
+        return
+
+    track = player.current
+
+    await player.play(track, replace=True)
+
+    await interaction.response.send_message(
+        f"🔄 Replaying **{track.title}**"
     )
 
 
 # ============================================================
-# FORWARD / REWIND ALIASES
+# /JOIN
 # ============================================================
 
-@bot.tree.command(
-    name="fwd",
-    description="Forward the song."
-)
-@app_commands.describe(
-    seconds="Seconds"
-)
-async def fwd(
-    interaction,
-    seconds: int = 10
-):
+@bot.tree.command(name="join", description="Join your voice channel")
+async def join(interaction: discord.Interaction):
 
-    await forward.callback(
-        interaction,
-        seconds
+    await interaction.response.defer()
+
+    player = await ensure_voice(interaction)
+
+    if player:
+        await interaction.followup.send(
+            f"🔊 Joined **{player.channel.name}**."
+        )
+
+
+@bot.tree.command(name="summon", description="Join your voice channel")
+async def summon(interaction: discord.Interaction):
+    await join(interaction)
+
+
+# ============================================================
+# /LEAVE
+# ============================================================
+
+@bot.tree.command(name="leave", description="Leave voice channel")
+async def leave(interaction: discord.Interaction):
+
+    player = get_player(interaction.guild)
+
+    if not player:
+        await interaction.response.send_message(
+            "❌ I'm not in a voice channel."
+        )
+        return
+
+    await player.disconnect()
+
+    await interaction.response.send_message(
+        "👋 Disconnected."
     )
 
 
-@bot.tree.command(
-    name="rwd",
-    description="Rewind the song."
-)
-@app_commands.describe(
-    seconds="Seconds"
-)
-async def rwd(
-    interaction,
-    seconds: int = 10
-):
+@bot.tree.command(name="disconnect", description="Disconnect from voice")
+async def disconnect(interaction: discord.Interaction):
+    await leave(interaction)
 
-    await rewind.callback(
-        interaction,
-        seconds
-    )
+
+@bot.tree.command(name="fuckoff", description="Disconnect")
+async def fuckoff(interaction: discord.Interaction):
+    await leave(interaction)
+
+
+@bot.tree.command(name="leavecleanup", description="Disconnect and clear queue")
+async def leavecleanup(interaction: discord.Interaction):
+    await leave(interaction)
 
 
 # ============================================================
 # /HISTORY
 # ============================================================
 
-@bot.tree.command(
-    name="history",
-    description="Show recently played songs."
-)
-async def history(interaction):
+@bot.tree.command(name="history", description="Show recently played songs")
+async def history(interaction: discord.Interaction):
 
-    tracks = list(
-        guild_history[
-            interaction.guild.id
-        ]
-    )
+    tracks = bot.history.get(interaction.guild.id, [])
 
     if not tracks:
-
-        return await interaction.response.send_message(
-            "No history yet."
+        await interaction.response.send_message(
+            "📜 No history yet."
         )
+        return
 
-    lines = []
+    text = ""
 
-    for number, track in enumerate(
-        tracks[:20],
-        1
-    ):
-
-        lines.append(
-            track_text(
-                track,
-                number
-            )
-        )
+    for i, track in enumerate(list(tracks)[:15], 1):
+        text += f"`{i}.` {track.title[:80]}\n"
 
     embed = discord.Embed(
-        title="🕘 ErYx Music History",
-        description="\n\n".join(lines)
+        title="📜 Music History",
+        description=text,
+        color=discord.Color.blurple()
     )
 
     await interaction.response.send_message(
@@ -1938,182 +1240,106 @@ async def history(interaction):
     )
 
 
-@bot.tree.command(
-    name="hist",
-    description="Show music history."
-)
-async def hist(interaction):
-
-    await history.callback(
-        interaction
-    )
+@bot.tree.command(name="hist", description="Show history")
+async def hist(interaction: discord.Interaction):
+    await history(interaction)
 
 
-@bot.tree.command(
-    name="recent",
-    description="Show recently played songs."
-)
-async def recent(interaction):
-
-    await history.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /LIKE
-# ============================================================
-
-@bot.tree.command(
-    name="like",
-    description="Like the current song."
-)
-async def like(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
-        )
-
-    guild_likes[
-        interaction.guild.id
-    ].add(
-        player.current.identifier
-    )
-
-    await interaction.response.send_message(
-        f"❤️ Liked **{player.current.title}**."
-    )
-
-
-# ============================================================
-# LIKE ALIASES
-# ============================================================
-
-@bot.tree.command(
-    name="heart",
-    description="Like current song."
-)
-async def heart(interaction):
-
-    await like.callback(
-        interaction
-    )
-
-
-@bot.tree.command(
-    name="love",
-    description="Like current song."
-)
-async def love(interaction):
-
-    await like.callback(
-        interaction
-    )
-
-
-@bot.tree.command(
-    name="likes",
-    description="Show liked song count."
-)
-async def likes(interaction):
-
-    amount = len(
-        guild_likes[
-            interaction.guild.id
-        ]
-    )
-
-    await interaction.response.send_message(
-        f"❤️ Liked tracks: **{amount}**"
-    )
-
-
-@bot.tree.command(
-    name="liked",
-    description="Show liked song count."
-)
-async def liked(interaction):
-
-    await likes.callback(
-        interaction
-    )
+@bot.tree.command(name="recent", description="Show recently played songs")
+async def recent(interaction: discord.Interaction):
+    await history(interaction)
 
 
 # ============================================================
 # /FAVORITES
 # ============================================================
 
-@bot.tree.command(
-    name="favorites",
-    description="Show favorite songs."
-)
-async def favorites(interaction):
+@bot.tree.command(name="favorites", description="Show your favorites")
+async def favorites(interaction: discord.Interaction):
 
-    tracks = guild_favorites[
-        interaction.guild.id
-    ]
+    songs = bot.favorites.get(interaction.user.id, [])
 
-    if not tracks:
-
-        return await interaction.response.send_message(
-            "No favorites saved yet."
+    if not songs:
+        await interaction.response.send_message(
+            "❤️ You don't have any favorites saved yet."
         )
+        return
 
-    lines = []
-
-    for number, track in enumerate(
-        tracks[:20],
-        1
-    ):
-
-        lines.append(
-            track_text(
-                track,
-                number
-            )
-        )
+    text = "\n".join(
+        f"`{i}.` {song[:90]}"
+        for i, song in enumerate(songs[:20], 1)
+    )
 
     await interaction.response.send_message(
-        embed=discord.Embed(
-            title="❤️ Favorites",
-            description="\n\n".join(lines)
-        )
+        f"❤️ **Your Favorites**\n{text}"
     )
+
+
+@bot.tree.command(name="liked", description="Show liked songs")
+async def liked(interaction: discord.Interaction):
+    await favorites(interaction)
+
+
+@bot.tree.command(name="likes", description="Show liked songs")
+async def likes(interaction: discord.Interaction):
+    await favorites(interaction)
+
+
+# ============================================================
+# /LIKE
+# ============================================================
+
+@bot.tree.command(name="like", description="Save current song")
+async def like(interaction: discord.Interaction):
+
+    player = get_player(interaction.guild)
+
+    if not player or not player.current:
+        await interaction.response.send_message(
+            "❌ Nothing is playing."
+        )
+        return
+
+    track = player.current
+
+    songs = bot.favorites.setdefault(
+        interaction.user.id,
+        []
+    )
+
+    if track.title not in songs:
+        songs.append(track.title)
+
+    await interaction.response.send_message(
+        f"❤️ Saved **{track.title}**"
+    )
+
+
+@bot.tree.command(name="heart", description="Like current song")
+async def heart(interaction: discord.Interaction):
+    await like(interaction)
+
+
+@bot.tree.command(name="love", description="Like current song")
+async def love(interaction: discord.Interaction):
+    await like(interaction)
 
 
 # ============================================================
 # /VOTESKIP
 # ============================================================
 
-@bot.tree.command(
-    name="voteskip",
-    description="Vote to skip the current song."
-)
-async def voteskip(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
-        )
-
-    await player.skip()
+@bot.tree.command(name="voteskip", description="Skip current song")
+async def voteskip(interaction: discord.Interaction):
 
     await interaction.response.send_message(
-        "⏭ Skip vote passed."
+        "🗳️ Vote received. Skipping."
     )
+
+    player = get_player(interaction.guild)
+
+    if player and player.playing:
+        await player.skip()
 
 
 # ============================================================
@@ -2122,397 +1348,40 @@ async def voteskip(interaction):
 
 @bot.tree.command(
     name="removedupes",
-    description="Remove duplicate queue tracks."
+    description="Remove duplicate songs"
 )
-async def removedupes(interaction):
+async def removedupes(interaction: discord.Interaction):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
     if not player:
-
-        return await interaction.response.send_message(
-            "Queue is empty.",
-            ephemeral=True
+        await interaction.response.send_message(
+            "❌ Not connected."
         )
+        return
 
-    tracks = list(
-        player.queue
-    )
+    items = list(player.queue)
+
+    seen = set()
+    unique = []
+
+    for track in items:
+
+        key = track.title.lower()
+
+        if key not in seen:
+            seen.add(key)
+            unique.append(track)
+
+    removed = len(items) - len(unique)
 
     player.queue.clear()
 
-    seen = set()
-    removed = 0
-
-    for track in tracks:
-
-        key = (
-            track.title.lower(),
-            track.author.lower()
-        )
-
-        if key in seen:
-
-            removed += 1
-            continue
-
-        seen.add(key)
-
-        await player.queue.put_wait(
-            track
-        )
+    for track in unique:
+        player.queue.put(track)
 
     await interaction.response.send_message(
-        f"Removed **{removed}** duplicate(s)."
-    )
-
-
-@bot.tree.command(
-    name="rd",
-    description="Remove duplicate tracks."
-)
-async def rd(interaction):
-
-    await removedupes.callback(
-        interaction
-    )
-
-
-# ============================================================
-# EFFECTS
-# ============================================================
-
-EFFECTS = {
-    "nightcore": "Nightcore",
-    "slow": "Slow",
-    "deep": "Deep Voice",
-    "chipmunk": "Chipmunk",
-    "speed": "Speed",
-    "vaporwave": "Vaporwave",
-    "karaoke": "Karaoke",
-    "tremolo": "Tremolo",
-    "vibrato": "Vibrato",
-    "distortion": "Distortion",
-    "bassboost": "Bass Boost",
-    "lowpass": "Low Pass",
-    "reset": "Reset"
-}
-
-
-async def set_effect(
-    player,
-    effect
-):
-
-    filters = wavelink.Filters()
-
-    if effect == "reset":
-
-        await player.set_filters(
-            filters
-        )
-
-        return
-
-    if effect == "nightcore":
-
-        filters.timescale.set(
-            speed=1.25,
-            pitch=1.25,
-            rate=1.0
-        )
-
-    elif effect == "slow":
-
-        filters.timescale.set(
-            speed=0.80,
-            pitch=1.0,
-            rate=1.0
-        )
-
-    elif effect == "deep":
-
-        filters.timescale.set(
-            speed=1.0,
-            pitch=0.75,
-            rate=1.0
-        )
-
-    elif effect == "chipmunk":
-
-        filters.timescale.set(
-            speed=1.0,
-            pitch=1.35,
-            rate=1.0
-        )
-
-    elif effect == "speed":
-
-        filters.timescale.set(
-            speed=1.5,
-            pitch=1.0,
-            rate=1.0
-        )
-
-    elif effect == "vaporwave":
-
-        filters.timescale.set(
-            speed=0.8,
-            pitch=0.8,
-            rate=1.0
-        )
-
-    elif effect == "karaoke":
-
-        filters.karaoke.set(
-            level=1.0,
-            mono_level=1.0,
-            filter_band=220.0,
-            filter_width=100.0
-        )
-
-    elif effect == "tremolo":
-
-        filters.tremolo.set(
-            frequency=5.0,
-            depth=0.7
-        )
-
-    elif effect == "vibrato":
-
-        filters.vibrato.set(
-            frequency=5.0,
-            depth=0.7
-        )
-
-    elif effect == "distortion":
-
-        filters.distortion.set(
-            sin_offset=0.0,
-            sin_scale=1.0,
-            cos_offset=0.0,
-            cos_scale=1.0,
-            tan_offset=0.0,
-            tan_scale=1.0,
-            offset=0.0,
-            scale=1.0
-        )
-
-    elif effect == "bassboost":
-
-        filters.equalizer.set(
-            bands=[
-                {"band": 0, "gain": 0.35},
-                {"band": 1, "gain": 0.30},
-                {"band": 2, "gain": 0.25},
-                {"band": 3, "gain": 0.20},
-            ]
-        )
-
-    elif effect == "lowpass":
-
-        filters.low_pass.set(
-            smoothing=20.0
-        )
-
-    await player.set_filters(
-        filters,
-        seek=True
-    )
-
-
-@bot.tree.command(
-    name="effects",
-    description="Apply a music effect."
-)
-@app_commands.describe(
-    effect="Effect name"
-)
-async def effects(
-    interaction,
-    effect: str
-):
-
-    effect = effect.lower()
-
-    if effect not in EFFECTS:
-
-        return await interaction.response.send_message(
-            "Available effects:\n"
-            "`nightcore` • `slow` • `deep` • "
-            "`chipmunk` • `speed` • `vaporwave` • "
-            "`karaoke` • `tremolo` • `vibrato` • "
-            "`distortion` • `bassboost` • `lowpass` • "
-            "`reset`",
-            ephemeral=True
-        )
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player:
-
-        return await interaction.response.send_message(
-            "I'm not connected.",
-            ephemeral=True
-        )
-
-    try:
-
-        await set_effect(
-            player,
-            effect
-        )
-
-        await interaction.response.send_message(
-            f"🎛 Effect: **{EFFECTS[effect]}**"
-        )
-
-    except Exception as e:
-
-        print(
-            f"[EFFECT ERROR] "
-            f"{type(e).__name__}: {e}"
-        )
-
-        await interaction.response.send_message(
-            f"Effect error: "
-            f"`{type(e).__name__}`",
-            ephemeral=True
-        )
-
-
-# ============================================================
-# /SETTINGS
-# ============================================================
-
-@bot.tree.command(
-    name="settings",
-    description="Show server music settings."
-)
-async def settings(interaction):
-
-    data = guild_settings[
-        interaction.guild.id
-    ]
-
-    embed = discord.Embed(
-        title="⚙ ErYx Music Settings"
-    )
-
-    embed.add_field(
-        name="Volume",
-        value=f"{data['volume']}%"
-    )
-
-    embed.add_field(
-        name="Loop",
-        value=data["loop"]
-    )
-
-    embed.add_field(
-        name="Voice Cleanup",
-        value=(
-            "ON"
-            if data["cleanup"]
-            else "OFF"
-        )
-    )
-
-    await interaction.response.send_message(
-        embed=embed
-    )
-
-
-@bot.tree.command(
-    name="setting",
-    description="Show settings."
-)
-async def setting(interaction):
-
-    await settings.callback(
-        interaction
-    )
-
-
-@bot.tree.command(
-    name="s",
-    description="Show settings."
-)
-async def s(interaction):
-
-    await settings.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /CONTROLS
-# ============================================================
-
-@bot.tree.command(
-    name="control",
-    description="Show music controls."
-)
-async def control(interaction):
-
-    embed = discord.Embed(
-        title="🎛 ErYx Music Controls",
-        description=(
-            "`/play` — Play\n"
-            "`/pause` — Pause\n"
-            "`/resume` — Resume\n"
-            "`/skip` — Skip\n"
-            "`/stop` — Stop\n"
-            "`/queue` — Queue\n"
-            "`/shuffle` — Shuffle\n"
-            "`/volume` — Volume\n"
-            "`/seek` — Seek\n"
-            "`/forward` — Forward\n"
-            "`/rewind` — Rewind\n"
-            "`/loop` — Loop\n"
-            "`/effects` — Effects"
-        )
-    )
-
-    await interaction.response.send_message(
-        embed=embed
-    )
-
-
-@bot.tree.command(
-    name="controls",
-    description="Show music controls."
-)
-async def controls(interaction):
-
-    await control.callback(
-        interaction
-    )
-
-
-@bot.tree.command(
-    name="ctrl",
-    description="Show music controls."
-)
-async def ctrl(interaction):
-
-    await control.callback(
-        interaction
-    )
-
-
-@bot.tree.command(
-    name="ct",
-    description="Show music controls."
-)
-async def ct(interaction):
-
-    await control.callback(
-        interaction
+        f"🧹 Removed **{removed}** duplicates."
     )
 
 
@@ -2520,116 +1389,13 @@ async def ct(interaction):
 # /PING
 # ============================================================
 
-@bot.tree.command(
-    name="ping",
-    description="Show bot latency."
-)
-async def ping(interaction):
+@bot.tree.command(name="ping", description="Check bot latency")
+async def ping(interaction: discord.Interaction):
 
-    discord_ping = round(
-        bot.latency * 1000
-    )
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if player:
-
-        try:
-            lavalink_ping = player.ping
-        except Exception:
-            lavalink_ping = "N/A"
-
-    else:
-
-        lavalink_ping = "N/A"
+    latency = round(bot.latency * 1000)
 
     await interaction.response.send_message(
-        f"🏓 Discord: `{discord_ping}ms`\n"
-        f"🎵 Lavalink: `{lavalink_ping}ms`"
-    )
-
-
-# ============================================================
-# /HELP
-# ============================================================
-
-@bot.tree.command(
-    name="help",
-    description="Show ErYx Music commands."
-)
-async def help_command(interaction):
-
-    embed = discord.Embed(
-        title="🎵 ErYx Music",
-        description=(
-            "**Playback**\n"
-            "`/play` `/playnow` `/playskip` `/skip` "
-            "`/stop` `/pause` `/resume`\n\n"
-
-            "**Queue**\n"
-            "`/queue` `/clear` `/remove` `/move` "
-            "`/shuffle` `/playtop` `/skipto`\n\n"
-
-            "**Music**\n"
-            "`/search` `/nowplaying` `/history` "
-            "`/volume` `/loop` `/effects`\n\n"
-
-            "**Controls**\n"
-            "`/seek` `/forward` `/rewind` `/replay`\n\n"
-
-            "**Quick play**\n"
-            "`P <song>`"
-        )
-    )
-
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
-    )
-
-
-# ============================================================
-# /ALIASES
-# ============================================================
-
-@bot.tree.command(
-    name="aliases",
-    description="Show ErYx Music aliases."
-)
-async def aliases(interaction):
-
-    embed = discord.Embed(
-        title="🔗 ErYx Music Aliases",
-        description=(
-            "`/p` → `/play`\n"
-            "`/q` → `/queue`\n"
-            "`/vol` → `/volume`\n"
-            "`/c` → `/clear`\n"
-            "`/dc` → `/disconnect`\n"
-            "`/fskip` → `/forceskip`\n"
-            "`/fs` → `/forceskip`\n"
-            "`/np` → `/nowplaying`\n"
-            "`/pn` → `/nowplaying`\n"
-            "`/m` → `/nowplaying`\n"
-            "`/pt` → `/playtop`\n"
-            "`/ptop` → `/playtop`\n"
-            "`/rm` → `/remove`\n"
-            "`/rd` → `/removedupes`\n"
-            "`/hist` → `/history`\n"
-            "`/recent` → `/history`\n"
-            "`/fwd` → `/forward`\n"
-            "`/rwd` → `/rewind`\n"
-            "`/qloop` → `/loopqueue`\n"
-            "`/loopq` → `/loopqueue`\n"
-            "`/queueloop` → `/loopqueue`"
-        )
-    )
-
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True
+        f"🏓 `{latency}ms`"
     )
 
 
@@ -2639,44 +1405,38 @@ async def aliases(interaction):
 
 @bot.tree.command(
     name="serverprofile",
-    description="Show server music information."
+    description="Show server music profile"
 )
-async def serverprofile(interaction):
+async def serverprofile(interaction: discord.Interaction):
 
     guild = interaction.guild
     player = get_player(guild)
 
-    voice = (
-        player.channel.name
-        if player and player.channel
-        else "Not connected"
-    )
-
     embed = discord.Embed(
-        title=f"🎵 {guild.name}"
+        title=f"🎵 {guild.name}",
+        color=discord.Color.blurple()
     )
 
     embed.add_field(
         name="Members",
-        value=str(
-            guild.member_count
-        )
+        value=str(guild.member_count),
+        inline=True
     )
 
     embed.add_field(
         name="Voice",
-        value=voice
+        value=(
+            player.channel.name
+            if player and player.channel
+            else "Not connected"
+        ),
+        inline=True
     )
 
     embed.add_field(
-        name="History",
-        value=str(
-            len(
-                guild_history[
-                    guild.id
-                ]
-            )
-        )
+        name="Loop",
+        value=bot.loops.get(guild.id, "off"),
+        inline=True
     )
 
     await interaction.response.send_message(
@@ -2685,193 +1445,121 @@ async def serverprofile(interaction):
 
 
 # ============================================================
-# /LYRICS
+# /SETTINGS
 # ============================================================
 
 @bot.tree.command(
-    name="lyrics",
-    description="Show lyrics information."
+    name="settings",
+    description="Show music settings"
 )
-async def lyrics(interaction):
+async def settings(interaction: discord.Interaction):
 
-    player = get_player(
-        interaction.guild
-    )
+    player = get_player(interaction.guild)
 
-    if not player or not player.current:
-
-        return await interaction.response.send_message(
-            "Nothing is playing.",
-            ephemeral=True
-        )
+    volume_value = getattr(player, "volume", 100) if player else 100
 
     await interaction.response.send_message(
-        "Lyrics provider isn't configured yet.\n"
-        f"Current track: **{player.current.title}**"
+        f"⚙️ **ErYx Music Settings**\n"
+        f"Volume: **{volume_value}%**\n"
+        f"Loop: **{bot.loops.get(interaction.guild.id, 'off')}**\n"
+        f"Prefix: `{PREFIX}`"
     )
 
 
-@bot.tree.command(
-    name="ly",
-    description="Lyrics."
-)
-async def ly(interaction):
-
-    await lyrics.callback(
-        interaction
-    )
+@bot.tree.command(name="setting", description="Show settings")
+async def setting(interaction: discord.Interaction):
+    await settings(interaction)
 
 
 # ============================================================
-# /FEEDBACK
+# /CONTROL
 # ============================================================
 
 @bot.tree.command(
-    name="feedback",
-    description="Send ErYx Music feedback."
+    name="control",
+    description="Show music controls"
 )
-@app_commands.describe(
-    message="Your feedback"
-)
-async def feedback(
-    interaction,
-    message: str
-):
-
-    guild_feedback[
-        interaction.guild.id
-    ].append(
-        {
-            "user": interaction.user.id,
-            "message": message,
-            "time": int(time.time())
-        }
-    )
+async def control(interaction: discord.Interaction):
 
     await interaction.response.send_message(
-        "Feedback received."
+        "🎛️ **ErYx Music Controls**\n\n"
+        "`/play` — Play\n"
+        "`/skip` — Skip\n"
+        "`/pause` — Pause\n"
+        "`/resume` — Resume\n"
+        "`/stop` — Stop\n"
+        "`/queue` — Queue\n"
+        "`/volume` — Volume\n"
+        "`/loop` — Loop"
     )
 
 
+@bot.tree.command(name="controls", description="Show controls")
+async def controls(interaction: discord.Interaction):
+    await control(interaction)
+
+
+@bot.tree.command(name="ctrl", description="Show controls")
+async def ctrl(interaction: discord.Interaction):
+    await control(interaction)
+
+
+@bot.tree.command(name="ct", description="Show controls")
+async def ct(interaction: discord.Interaction):
+    await control(interaction)
+
+
 # ============================================================
-# /CHANGELOG
+# /ALIASES
 # ============================================================
 
 @bot.tree.command(
-    name="changelog",
-    description="Show ErYx Music changelog."
+    name="aliases",
+    description="Show command aliases"
 )
-async def changelog(interaction):
-
-    embed = discord.Embed(
-        title="ErYx Music — Changelog",
-        description=(
-            "• Lavalink v4\n"
-            "• Wavelink 3.x\n"
-            "• 300% volume maximum\n"
-            "• Top 15 search suggestions\n"
-            "• Queue system\n"
-            "• History\n"
-            "• Likes\n"
-            "• Favorites\n"
-            "• Loop modes\n"
-            "• Playback effects\n"
-            "• Prefix quick play"
-        )
-    )
+async def aliases(interaction: discord.Interaction):
 
     await interaction.response.send_message(
-        embed=embed
+        "**ErYx Music Aliases**\n\n"
+        "`/p` → `/play`\n"
+        "`/pn` → `/playnow`\n"
+        "`/pskip` → `/skip`\n"
+        "`/fskip` → `/skip`\n"
+        "`/fs` → `/skip`\n"
+        "`/vol` → `/volume`\n"
+        "`/q` → `/queue`\n"
+        "`/np` → `/nowplaying`\n"
+        "`/hist` → `/history`\n"
+        "`/rm` → `/remove`\n"
+        "`/fwd` → `/forward`\n"
+        "`/rwd` → `/rewind`"
     )
 
 
 # ============================================================
-# /START
-# ============================================================
-
-@bot.tree.command(
-    name="start",
-    description="Start or resume the player."
-)
-async def start(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    if not player:
-
-        player = await connect_player(
-            interaction
-        )
-
-        if not player:
-            return
-
-    if player.paused:
-
-        await player.pause(
-            False
-        )
-
-    await simple_message(
-        interaction,
-        "▶ Player ready."
-    )
-
-
-# ============================================================
-# /LEAVECLEANUP
+# /EFFECTS
 # ============================================================
 
 @bot.tree.command(
-    name="leavecleanup",
-    description="Toggle automatic voice cleanup."
+    name="effects",
+    description="Show available audio effects"
 )
-async def leavecleanup(interaction):
-
-    settings_data = guild_settings[
-        interaction.guild.id
-    ]
-
-    settings_data["cleanup"] = not (
-        settings_data["cleanup"]
-    )
-
-    status = (
-        "ON"
-        if settings_data["cleanup"]
-        else "OFF"
-    )
+async def effects(interaction: discord.Interaction):
 
     await interaction.response.send_message(
-        f"Voice cleanup: **{status}**"
-    )
-
-
-@bot.tree.command(
-    name="lc",
-    description="Toggle voice cleanup."
-)
-async def lc(interaction):
-
-    await leavecleanup.callback(
-        interaction
-    )
-
-
-# ============================================================
-# /PREMIUM
-# ============================================================
-
-@bot.tree.command(
-    name="premium",
-    description="Show premium information."
-)
-async def premium(interaction):
-
-    await interaction.response.send_message(
-        "ErYx Music premium isn't enabled in this build."
+        "🎚️ **Available Effects**\n\n"
+        "`nightcore`\n"
+        "`slow`\n"
+        "`deep`\n"
+        "`chipmunk`\n"
+        "`vaporwave`\n"
+        "`karaoke`\n"
+        "`tremolo`\n"
+        "`vibrato`\n"
+        "`distortion`\n"
+        "`bassboost`\n"
+        "`lowpass`\n"
+        "`reset`"
     )
 
 
@@ -2881,103 +1569,77 @@ async def premium(interaction):
 
 @bot.tree.command(
     name="drm",
-    description="Show player status."
+    description="Show playback compatibility"
 )
-async def drm(interaction):
-
-    player = get_player(
-        interaction.guild
-    )
-
-    status = (
-        "Connected"
-        if player
-        else "Disconnected"
-    )
+async def drm(interaction: discord.Interaction):
 
     await interaction.response.send_message(
-        f"Player status: **{status}**"
+        "ℹ️ Playback is handled through Lavalink. "
+        "Some tracks may be unavailable depending on the source."
     )
 
 
 # ============================================================
-# /NEW
+# /PREMIUM
 # ============================================================
 
 @bot.tree.command(
-    name="new",
-    description="Show ErYx Music status."
+    name="premium",
+    description="Show premium status"
 )
-async def new(interaction):
+async def premium(interaction: discord.Interaction):
 
     await interaction.response.send_message(
-        "ErYx Music is online."
+        "⭐ ErYx Music premium features are currently unavailable."
     )
 
 
 # ============================================================
-# /MOVE
+# /CHANGELOG
 # ============================================================
 
 @bot.tree.command(
-    name="move",
-    description="Move a queue track."
+    name="changelog",
+    description="Show latest bot changes"
 )
-@app_commands.describe(
-    old_position="Current queue position",
-    new_position="New queue position"
+async def changelog(interaction: discord.Interaction):
+
+    await interaction.response.send_message(
+        "📋 **ErYx Music Changelog**\n\n"
+        "• Wavelink playback\n"
+        "• Lavalink support\n"
+        "• 300% volume limit\n"
+        "• Queue controls\n"
+        "• Search\n"
+        "• History\n"
+        "• Favorites\n"
+        "• Loop modes\n"
+        "• Prefix commands"
+    )
+
+
+# ============================================================
+# /FEEDBACK
+# ============================================================
+
+@bot.tree.command(
+    name="feedback",
+    description="Send feedback"
 )
-async def move(
-    interaction,
-    old_position: int,
-    new_position: int
+@app_commands.describe(message="Your feedback")
+async def feedback(
+    interaction: discord.Interaction,
+    message: str
 ):
 
-    player = get_player(
-        interaction.guild
+    print(
+        f"[Feedback] "
+        f"{interaction.user} ({interaction.user.id}): "
+        f"{message}"
     )
-
-    if not player:
-
-        return await interaction.response.send_message(
-            "Queue is empty.",
-            ephemeral=True
-        )
-
-    tracks = list(
-        player.queue
-    )
-
-    if not (
-        1 <= old_position <= len(tracks)
-        and
-        1 <= new_position <= len(tracks)
-    ):
-
-        return await interaction.response.send_message(
-            "Invalid positions.",
-            ephemeral=True
-        )
-
-    track = tracks.pop(
-        old_position - 1
-    )
-
-    tracks.insert(
-        new_position - 1,
-        track
-    )
-
-    player.queue.clear()
-
-    for item in tracks:
-
-        await player.queue.put_wait(
-            item
-        )
 
     await interaction.response.send_message(
-        f"Moved **{track.title}**."
+        "✅ Feedback received. Thanks."
     )
 
 
@@ -2985,378 +1647,200 @@ async def move(
 # PREFIX COMMANDS
 # ============================================================
 
-@bot.command(
-    name="play"
-)
+@bot.command(name="play")
 async def prefix_play(
-    ctx,
+    ctx: commands.Context,
     *,
-    query=None
+    query: str
 ):
+    await play_track_prefix(ctx, query)
 
-    if not query:
 
-        return await ctx.send(
-            f"Usage: `{PREFIX}play <song>`"
-        )
+async def play_track_prefix(ctx, query):
 
-    if not ctx.author.voice:
+    player = ctx.guild.voice_client
 
-        return await ctx.send(
-            "Join a voice channel first."
-        )
+    if not player:
 
-    channel = ctx.author.voice.channel
+        channel = getattr(ctx.author.voice, "channel", None)
 
-    player = get_player(
-        ctx.guild
-    )
-
-    try:
-
-        if not player:
-
-            player = await channel.connect(
-                cls=wavelink.Player,
-                self_deaf=True
+        if not channel:
+            await ctx.send(
+                "❌ Join a voice channel first."
             )
-
-        text_channels[
-            ctx.guild.id
-        ] = ctx.channel
-
-        track = await get_first_track(
-            query
-        )
-
-        if not track:
-
-            return await ctx.send(
-                "No results found."
-            )
-
-        started = await add_track(
-            player,
-            track
-        )
-
-        await ctx.send(
-            (
-                f"▶ Playing **{track.title}**"
-                if started
-                else f"Queued **{track.title}**"
-            )
-        )
-
-    except Exception as e:
-
-        print(
-            f"[PREFIX PLAY] {e}"
-        )
-
-        await ctx.send(
-            f"Playback error: "
-            f"`{type(e).__name__}`"
-        )
-
-
-# ============================================================
-# P <SONG>
-#
-# Examples:
-#
-# P Believer
-# p Believer
-# ============================================================
-
-@bot.listen()
-async def eryx_quick_play(message):
-
-    if message.author.bot:
-        return
-
-    content = message.content.strip()
-
-    if not content:
-        return
-
-    if (
-        content.lower().startswith("p ")
-        and not content.startswith(PREFIX)
-    ):
-
-        query = content[2:].strip()
-
-        if not query:
             return
 
-        if not message.author.voice:
-            return
-
-        channel = message.author.voice.channel
-
-        player = get_player(
-            message.guild
+        player = await channel.connect(
+            cls=wavelink.Player
         )
 
-        try:
+    tracks = await search_track(query)
 
-            if not player:
+    if not tracks:
+        await ctx.send("❌ No results found.")
+        return
 
-                player = await channel.connect(
-                    cls=wavelink.Player,
-                    self_deaf=True
-                )
+    track = tracks[0]
 
-            text_channels[
-                message.guild.id
-            ] = message.channel
+    if player.playing:
+        player.queue.put(track)
 
-            track = await get_first_track(
-                query
-            )
+        await ctx.send(
+            f"➕ **{track.title}** added to queue."
+        )
 
-            if not track:
-                return
+    else:
 
-            started = await add_track(
-                player,
-                track
-            )
+        await player.play(track)
 
-            await message.channel.send(
-                (
-                    f"▶ Playing **{track.title}**"
-                    if started
-                    else f"Queued **{track.title}**"
-                )
-            )
+        await ctx.send(
+            f"▶️ Playing **{track.title}**"
+        )
 
-        except Exception as e:
-
-            print(
-                f"[P QUICK PLAY] {e}"
-            )
-
-
-# ============================================================
-# PREFIX ALIASES
-# ============================================================
 
 @bot.command(name="skip")
 async def prefix_skip(ctx):
+    player = ctx.guild.voice_client
 
-    player = get_player(
-        ctx.guild
-    )
-
-    if not player or not player.current:
-
-        return await ctx.send(
-            "Nothing is playing."
-        )
-
-    await player.skip()
-
-    await ctx.send(
-        "⏭ Skipped."
-    )
+    if player and player.playing:
+        await player.skip()
+        await ctx.send("⏭️ Skipped.")
+    else:
+        await ctx.send("❌ Nothing is playing.")
 
 
 @bot.command(name="stop")
 async def prefix_stop(ctx):
-
-    player = get_player(
-        ctx.guild
-    )
+    player = ctx.guild.voice_client
 
     if not player:
-
-        return await ctx.send(
-            "Nothing is playing."
-        )
+        await ctx.send("❌ Not connected.")
+        return
 
     player.queue.clear()
 
-    await player.stop()
+    try:
+        await player.stop()
+    except Exception:
+        pass
 
-    await ctx.send(
-        "⏹ Stopped."
-    )
+    await ctx.send("⏹️ Stopped.")
 
 
 @bot.command(name="pause")
 async def prefix_pause(ctx):
 
-    player = get_player(
-        ctx.guild
-    )
+    player = ctx.guild.voice_client
 
     if not player:
+        await ctx.send("❌ Not connected.")
+        return
 
-        return await ctx.send(
-            "Nothing is playing."
-        )
+    await player.pause(True)
 
-    await player.pause(
-        True
-    )
-
-    await ctx.send(
-        "⏸ Paused."
-    )
+    await ctx.send("⏸️ Paused.")
 
 
 @bot.command(name="resume")
 async def prefix_resume(ctx):
 
-    player = get_player(
-        ctx.guild
-    )
+    player = ctx.guild.voice_client
 
     if not player:
+        await ctx.send("❌ Not connected.")
+        return
 
-        return await ctx.send(
-            "Nothing is playing."
-        )
+    await player.pause(False)
 
-    await player.pause(
-        False
-    )
-
-    await ctx.send(
-        "▶ Resumed."
-    )
+    await ctx.send("▶️ Resumed.")
 
 
 @bot.command(name="queue")
 async def prefix_queue(ctx):
 
-    player = get_player(
-        ctx.guild
-    )
+    player = ctx.guild.voice_client
 
     if not player:
+        await ctx.send("❌ Not connected.")
+        return
 
-        return await ctx.send(
-            "Queue is empty."
-        )
+    if not player.queue:
+        await ctx.send("📭 Queue is empty.")
+        return
 
-    tracks = list(
-        player.queue
-    )
+    text = ""
 
-    if not tracks:
-
-        return await ctx.send(
-            "Queue is empty."
-        )
-
-    lines = []
-
-    for number, track in enumerate(
-        tracks[:20],
-        1
-    ):
-
-        lines.append(
-            f"**{number}.** {track.title}"
-        )
+    for i, track in enumerate(list(player.queue)[:20], 1):
+        text += f"`{i}.` {track.title[:80]}\n"
 
     await ctx.send(
-        "🎵 **Queue**\n"
-        + "\n".join(lines)
+        f"🎵 **Queue**\n{text}"
     )
 
 
 @bot.command(name="vol")
-async def prefix_vol(
+async def prefix_volume(
     ctx,
-    amount: int
+    volume: int
 ):
 
-    # HARD 300% MAXIMUM
-    if amount < 0 or amount > 300:
-
-        return await ctx.send(
-            "Volume must be between **0% and 300%**."
-        )
-
-    player = get_player(
-        ctx.guild
-    )
+    player = ctx.guild.voice_client
 
     if not player:
+        await ctx.send("❌ Not connected.")
+        return
 
-        return await ctx.send(
-            "I'm not connected."
-        )
+    volume = max(0, min(volume, MAX_VOLUME))
 
-    await player.set_volume(
-        amount
-    )
+    await player.set_volume(volume)
 
     await ctx.send(
-        f"🔊 Volume: **{amount}%**"
+        f"🔊 Volume: **{volume}%**"
     )
 
-
-# ============================================================
-# PREFIX HELP
-# ============================================================
 
 @bot.command(name="help")
 async def prefix_help(ctx):
 
     await ctx.send(
-        f"🎵 **ErYx Music**\n\n"
-        f"`{PREFIX}play <song>`\n"
-        f"`{PREFIX}skip`\n"
-        f"`{PREFIX}stop`\n"
-        f"`{PREFIX}pause`\n"
-        f"`{PREFIX}resume`\n"
-        f"`{PREFIX}queue`\n"
-        f"`{PREFIX}vol <0-300>`\n\n"
-        f"Quick play:\n"
-        f"`P <song>`"
+        "**ErYx Music**\n\n"
+        "`!!play <song>`\n"
+        "`!!skip`\n"
+        "`!!stop`\n"
+        "`!!pause`\n"
+        "`!!resume`\n"
+        "`!!queue`\n"
+        "`!!vol <0-300>`\n\n"
+        "Slash commands are also available."
     )
 
 
 # ============================================================
-# PREFIX ERROR HANDLER
+# QUICK "P SONG"
 # ============================================================
 
-@bot.event
-async def on_command_error(
-    ctx,
-    error
-):
+@bot.listen()
+async def eryx_quick_play(message: discord.Message):
 
-    if isinstance(
-        error,
-        commands.CommandNotFound
-    ):
+    if message.author.bot:
         return
 
-    if isinstance(
-        error,
-        commands.MissingRequiredArgument
-    ):
-
-        await ctx.send(
-            "Missing required argument."
-        )
-
+    if not message.content.lower().startswith("p "):
         return
 
-    print(
-        f"[COMMAND ERROR] "
-        f"{type(error).__name__}: {error}"
+    query = message.content[2:].strip()
+
+    if not query:
+        return
+
+    await play_track_prefix(
+        message.channel,
+        query
     )
 
 
 # ============================================================
-# MESSAGE CONTENT
+# GENERAL MESSAGE PROCESSING
 # ============================================================
 
 @bot.event
@@ -3365,44 +1849,29 @@ async def on_message(message):
     if message.author.bot:
         return
 
-    # Prefix commands such as !!play
-    await bot.process_commands(
-        message
-    )
+    await bot.process_commands(message)
 
 
 # ============================================================
 # START
 # ============================================================
 
-if (
-    not DISCORD_TOKEN
-    or DISCORD_TOKEN.startswith(
-        "PASTE_"
-    )
-):
+if __name__ == "__main__":
 
-    raise RuntimeError(
-        "Put your Discord bot token "
-        "at the top of main.py."
-    )
+    if (
+        not DISCORD_TOKEN
+        or DISCORD_TOKEN == "YOUR_DISCORD_BOT_TOKEN"
+    ):
+        print("ERROR: Put your Discord bot token in main.py")
+        raise SystemExit(1)
 
+    if (
+        not LAVALINK_PASSWORD
+        or LAVALINK_PASSWORD == "YOUR_LAVALINK_PASSWORD"
+    ):
+        print("ERROR: Put your Lavalink password in main.py")
+        raise SystemExit(1)
 
-if (
-    not LAVALINK_PASSWORD
-    or LAVALINK_PASSWORD.startswith(
-        "PASTE_"
-    )
-):
+    print("[ErYx] Starting ErYx Music...")
 
-    raise RuntimeError(
-        "Put your Railway Lavalink password "
-        "at the top of main.py."
-    )
-
-
-print("[ErYx] Starting bot...")
-
-bot.run(
-    DISCORD_TOKEN
-    )
+    bot.run(DISCORD_TOKEN)
